@@ -1,0 +1,107 @@
+version: 2.1
+
+# ---------------------------------------------------------------------------
+# Why this config looks the way it does
+# ---------------------------------------------------------------------------
+#
+# The repo: a pnpm + turbo monorepo (~80 packages under packages/*, plus
+# tools/* and examples/*). Root scripts we lean on are `build:packages`
+# and `test`; see AGENTS.md for the maintainers' own command table.
+#
+# EXECUTOR IMAGE — cimg/node:22.21.1
+#   * cimg/node is CircleCI's Node convenience image: it ships node, npm,
+#     yarn AND pnpm on PATH, which is what circleci/setup-node needs (the
+#     function shells out to the detected package manager, it does not
+#     install one).
+#   * Node 22, not the 22.4 from the setup-node README example: the root
+#     package.json declares `engines.node: ^22.13.0 || ^24.0.0 || ^26.0.0`,
+#     and pnpm enforces engines, so anything below 22.13 fails the install
+#     with ERR_PNPM_UNSUPPORTED_ENGINE. 22.x is the lowest supported line,
+#     i.e. the version that catches "works on my newer node" breakage.
+#   * Pinned to a full patch tag rather than `22` or `lts` so a rebuild of
+#     an old commit gets the same toolchain.
+#   * Plain variant, not `-browsers`: the only browser-driven suite is the
+#     RSC Playwright e2e, which we skip via SKIP_RSC_E2E (below). If that
+#     suite is ever enabled here, switch to cimg/node:22.21.1-browsers.
+#   * pnpm's own version does not need pinning in the image: the root
+#     package.json has `packageManager: pnpm@11.23.0` and pnpm's
+#     manage-package-manager-versions is on by default, so whichever pnpm
+#     the image ships self-switches to 11.23.0 for this repo.
+#
+# RESOURCE CLASS — large
+#   Building + testing ~80 packages on the default `medium` (2 vCPU / 4 GB)
+#   is both slow and OOM-prone once several vitest projects run at once.
+#   `large` (4 vCPU / 8 GB) is the smallest class that comfortably fits.
+#
+# CONCURRENCY FLAGS — the important subtlety
+#   In the Docker executor, /proc reports the *host's* CPU count (dozens),
+#   not the container's share, so anything that sizes its worker pool from
+#   os.cpus()/availableParallelism() massively over-subscribes 4 vCPUs and
+#   thrashes (or gets OOM-killed, exit 137). Two caps deal with that:
+#     * `--concurrency=4` on turbo, overriding the `--concurrency 16` baked
+#       into the root scripts (tuned for dev laptops, not CI containers).
+#       That is why the steps below call `turbo` directly instead of
+#       `pnpm build:packages` / `pnpm test` — the filters are copied
+#       verbatim from those scripts, only the concurrency differs.
+#     * VITEST_MAX_WORKERS=2, so each vitest process keeps a small pool
+#       whatever it thinks the machine size is (vitest 4 reads this env
+#       var; the older VITEST_MAX_THREADS/FORKS names are no longer
+#       honoured, so they are not set here).
+#
+# OTHER FLAGS / ENV
+#   * setup-node is pinned to the current release (0.0.1-15ea7e5). No
+#     --app-dir: the lockfile lives at the repo root. No --package-manager:
+#     pnpm-lock.yaml already makes detection unambiguous. Caching is left
+#     at its default (--with-cache), and per the function's README there
+#     are deliberately NO restore_cache/save_cache steps around it — it
+#     owns that lifecycle and keys the cache off the lockfile checksum.
+#   * SKIP_RSC_E2E=1 — packages/rsc's `test` script chains a Playwright
+#     e2e run (scripts/run-e2e-ci.mjs) that boots a Next dev server and
+#     needs browser binaries; the script itself honours this flag. Its
+#     node/edge/ui vitest suites still run.
+#   * Build is `--filter=@ai-sdk/* --filter=ai` (i.e. `build:packages`),
+#     not a bare `turbo build`: a bare build also builds examples/*, which
+#     are demo apps that want provider API keys at build time and are not
+#     part of what this repo ships.
+#   * Tests exclude examples/* for the same reason. turbo's `test` task
+#     dependsOn `build`, so the build step above also warms the cache the
+#     test step needs — which is why install/build/test live in one job
+#     instead of three with a workspace handoff.
+#   * no_output_timeout is raised because turbo groups a task's output and
+#     can sit silent past the 10-minute default on a cold cache.
+#   * Telemetry/update prompts off (TURBO_TELEMETRY_DISABLED, DO_NOT_TRACK,
+#     NEXT_TELEMETRY_DISABLED) so nothing blocks on stdin or phones home.
+# ---------------------------------------------------------------------------
+
+jobs:
+  build-and-test:
+    docker:
+      - image: cimg/node:22.21.1
+    resource_class: large
+    environment:
+      SKIP_RSC_E2E: '1'
+      TURBO_TELEMETRY_DISABLED: '1'
+      NEXT_TELEMETRY_DISABLED: '1'
+      DO_NOT_TRACK: '1'
+      VITEST_MAX_WORKERS: '2'
+    steps:
+      - checkout
+
+      - run:
+          name: Install dependencies (pnpm, frozen lockfile)
+          command: circleci run circleci/setup-node@0.0.1-15ea7e5 -- install
+
+      - run:
+          name: Build packages
+          command: pnpm exec turbo run build --filter=@ai-sdk/* --filter=ai --concurrency=4
+          no_output_timeout: 30m
+
+      - run:
+          name: Run tests
+          command: pnpm exec turbo run test --filter=!@example/* --concurrency=4
+          no_output_timeout: 45m
+
+workflows:
+  build-and-test:
+    jobs:
+      - build-and-test
